@@ -28,9 +28,10 @@ from .simt import THREADS
 
 
 class Triage:
-    def __init__(self, words_per_head: int, sm90: bool):
+    def __init__(self, words_per_head: int, sm90: bool, num_heads: int = NUM_HEADS):
         self.words_per_head = words_per_head
         self.sm90 = sm90
+        self.num_heads = num_heads
 
     @cute.jit
     def __call__(
@@ -60,6 +61,7 @@ class Triage:
     @cute.kernel
     def kernel(self, mHealth, mBad, mKs, mKe, mQ, mW, mMap, mSks, mSke, mQg, mWg, mWhole, mWks, mWke, num_q: Int32):
         wph = self.words_per_head
+        num_heads = self.num_heads
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         smem = utils.SmemAllocator()
@@ -94,8 +96,8 @@ class Triage:
                 mSks[slot] = s
                 mSke[slot] = e
             if row >= 0:
-                for i in cutlass.range(tid, NUM_HEADS * wph, THREADS, unroll=4):
-                    dst = slot * (NUM_HEADS * wph) + i
+                for i in cutlass.range(tid, num_heads * wph, THREADS, unroll=4):
+                    dst = slot * (num_heads * wph) + i
                     if cutlass.const_expr(self.sm90):
                         # scan_sm90.q_n_of: row 2b + a, head 2c + e of an 8-row tile is operand row
                         # 128a + 8c + 2b + e.
@@ -105,7 +107,7 @@ class Triage:
                             + 2 * (r // 2) + head % 2
                         dst = op_row * wph + (i - head * wph)
                     mQg[dst] = mQ[(row, i)]
-                if tid < NUM_HEADS:
+                if tid < num_heads:
                     mWg[(slot, tid)] = mW[(row, tid)]
         else:
             r = (bid - RECOVERY_ROWS) * THREADS + tid

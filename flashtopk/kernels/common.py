@@ -10,13 +10,24 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import arith, llvm, math
 from cutlass.cutlass_dsl import dsl_user_op
 
-NUM_HEADS = 32
+NUM_HEADS = 32  # the default indexer head count; a call may also run NUM_HEADS_ALT heads
+NUM_HEADS_ALT = 64  # the other supported head count; both pack the same SCAN_N columns
 HEAD_DIM = 128
-NEXT_N = 8  # query rows of a scan tile
+SCAN_N = 256  # the scan/refine MMA N = num_heads * rows, fixed for every head count
+NEXT_N = SCAN_N // NUM_HEADS  # query rows of a scan tile (8 at 32 heads, 4 at 64)
 BLOCK_KV = 128  # keys of a KV block: KV splits and the pruning mask are counted in these
 PRUNE_BLOCK_Q = 16  # query rows of a pruning tile
-PRUNE_COLS = 16  # columns of the pruning operand
-REFINE_BLOCK_Q = 8  # query rows of a refine tile
+PRUNE_COLS = 16  # columns of the pruning operand (the retained-head projection, head-count free)
+REFINE_BLOCK_Q = SCAN_N // NUM_HEADS  # query rows of a refine tile (8 at 32 heads, 4 at 64)
+
+
+def rows_for(num_heads: int) -> int:
+    """Query rows a scan or refine tile covers at this head count, so NEXT_N * num_heads == SCAN_N."""
+    return SCAN_N // num_heads
+
+
+def supported_heads(num_heads: int) -> bool:
+    return num_heads in (NUM_HEADS, NUM_HEADS_ALT)
 
 
 @dsl_user_op

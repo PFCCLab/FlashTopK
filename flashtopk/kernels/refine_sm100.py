@@ -15,9 +15,9 @@
 # Modified by the FlashTopK authors (2026): the epilogue and TMEM read-out of scan_sm100.py (derived from
 # FlashInfer's selective-logits candidate kernel) behind a gather warpgroup that compacts the pruning pass's
 # surviving keys into tiles by cp.async, one MMA per compact tile.
-"""SM100 FlashTopK refine in CuTe DSL (FP8 or BF16, 32 heads), the second kernel of key pruning: one CTA per 8-row
-tile and KV split scores in full the keys prune_sm100.py's mask keeps for the tile, and leaves select the
-candidates the scan would.
+"""SM100 FlashTopK refine in CuTe DSL (FP8 or BF16, 32 or 64 heads), the second kernel of key pruning: one CTA per
+query tile (8 rows at 32 heads, 4 at 64: the scan's) and KV split scores in full the keys prune_sm100.py's mask keeps
+for the tile (its own plane: the mask is written per refine tile), and leaves select the candidates the scan would.
 
   * the gather warpgroup counts the survivors of each 128-key block of the CTA's range into a prefix sum in shared
     memory; gather warp w then fills compact tile w with survivors 128t .. 128t + 127 of every tile t = w (mod 4):
@@ -43,6 +43,9 @@ from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .common import (
+    NEXT_N,
+    NUM_HEADS,
+    SCAN_N,
     abs_f32,
     atomic_add_global_i32,
     cp_async_4,
@@ -57,8 +60,6 @@ from .common import (
 from .scan_sm100 import _RND_RN, NUM_W_IN_REG, i32_bits_to_fp32, named_barrier_sync_unaligned
 
 BLOCK_KV = 128
-BLOCK_Q = 8
-NUM_HEADS = 32
 HEAD_DIM = 128
 NUM_TILES = 4
 MAX_BLOCKS = 16384  # KV blocks a CTA's range may span: its survivor prefix is in shared memory
@@ -78,12 +79,15 @@ def max_blocks(bf16: bool) -> int:
 
 
 class RefineSm100:
-    def __init__(self, *, bf16: bool = False):
+    def __init__(self, *, bf16: bool = False, num_heads: int = NUM_HEADS):
         self.bf16 = bf16
+        self.num_heads = num_heads
+        self.block_q = SCAN_N // num_heads
         self.elem = cutlass.BFloat16 if bf16 else cutlass.Float8E4M3FN
         self.row_bytes = HEAD_DIM * (2 if bf16 else 1)
         self.max_blocks = max_blocks(bf16)
-        self.N = BLOCK_Q * NUM_HEADS
+        self.N = SCAN_N
+        self.w_in_reg = min(num_heads, NUM_W_IN_REG * NEXT_N // self.block_q)  # the scan's register weight cache
         self.threads_per_cta = 512
         self.num_math_threads = 256
         self.math_wg_registers = 216
@@ -135,9 +139,9 @@ class RefineSm100:
             sm100_utils.cluster_shape_to_tma_atom_B((1, 1), tiled_mma.thr_id),
             b, b_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape,
         )
-        w_layout = cute.make_layout((BLOCK_Q, NUM_HEADS), stride=(NUM_HEADS, 1))
+        w_layout = cute.make_layout((self.block_q, self.num_heads), stride=(self.num_heads, 1))
         tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), weights, w_layout, (BLOCK_Q, NUM_HEADS)
+            cpasync.CopyBulkTensorTileG2SOp(), weights, w_layout, (self.block_q, self.num_heads)
         )
         self.num_q_tma_bytes = cute.size_in_bytes(b.element_type, b_smem_layout) + self.N * 4
 
@@ -147,7 +151,7 @@ class RefineSm100:
             mbar: cute.struct.MemRange[cutlass.Int64, 2 + 2 * NUM_TILES + 4]
             tmem_holding_buf: Int32
 
-        num_tiles = (num_q + BLOCK_Q - 1) // BLOCK_Q
+        num_tiles = (num_q + self.block_q - 1) // self.block_q
         self.kernel(
             tiled_mma, tma_atom_b, tma_tensor_b, tma_atom_w, tma_tensor_w, kv, kv_scales, mask, row_start, row_end,
             origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, mask_blocks, num_splits,
@@ -187,7 +191,9 @@ class RefineSm100:
         gdimx, _, _ = cute.arch.grid_dim()
         lane = cute.arch.lane_idx()
         tile = gdimx - 1 - bidx
-        query_start = tile * BLOCK_Q
+        block_q = self.block_q
+        num_heads = self.num_heads
+        query_start = tile * block_q
 
         total_blocks = (seq_len_kv + BLOCK_KV - 1) // BLOCK_KV
         blocks_per_split = (total_blocks + num_splits - 1) // num_splits
@@ -195,7 +201,7 @@ class RefineSm100:
         split_hi = min((bidy + 1) * blocks_per_split * BLOCK_KV, seq_len_kv)
         range_lo = seq_len_kv
         range_hi = Int32(0)
-        for r in cutlass.range_constexpr(BLOCK_Q):
+        for r in cutlass.range_constexpr(block_q):
             row = query_start + r
             s = seq_len_kv
             e = Int32(0)
@@ -231,13 +237,13 @@ class RefineSm100:
             sMetaScale = smem.allocate_tensor(Float32, cute.make_layout((NUM_TILES, BLOCK_KV), stride=(BLOCK_KV, 1)), 16)
             sPrefix = smem.allocate_tensor(Int32, cute.make_layout((self.max_blocks + 1,)), 16)
             sW = smem.allocate_tensor(
-                Float32, cute.make_layout((BLOCK_Q, NUM_HEADS, 1), stride=(NUM_HEADS, 1, BLOCK_Q * NUM_HEADS)), 128
+                Float32, cute.make_layout((block_q, num_heads, 1), stride=(num_heads, 1, block_q * num_heads)), 128
             )
             sWarpWeights = smem.allocate_tensor(
-                Float32, cute.make_layout((8, BLOCK_Q, NUM_HEADS), stride=(self.N + 4, NUM_HEADS, 1)), 16
+                Float32, cute.make_layout((8, block_q, num_heads), stride=(self.N + 4, num_heads, 1)), 16
             )
-            sGate = smem.allocate_tensor(Float32, cute.make_layout((BLOCK_Q,)), 16)
-            sWin = smem.allocate_tensor(Int32, cute.make_layout((BLOCK_Q, 2), stride=(2, 1)), 16)
+            sGate = smem.allocate_tensor(Float32, cute.make_layout((block_q,)), 16)
+            sWin = smem.allocate_tensor(Int32, cute.make_layout((block_q, 2), stride=(2, 1)), 16)
             # The survivor count, then the gather warps' totals.
             sCounts = smem.allocate_tensor(Int32, cute.make_layout((5,)), 16)
 
@@ -251,7 +257,7 @@ class RefineSm100:
                     cute.arch.mbarrier_init(full_tmem + i, 1)
                     cute.arch.mbarrier_init(empty_tmem + i, 4)
                 cute.arch.mbarrier_init_fence()
-            if tidx < BLOCK_Q:
+            if tidx < block_q:
                 row_q = query_start + tidx
                 row = min(row_q, num_q - 1)
                 sGate[tidx] = loose_raw_gate(mInvDelta[row], mOrigin[row], mThBucket[row])
@@ -278,14 +284,14 @@ class RefineSm100:
                 cute.arch.setmaxregister_decrease(self.other_registers)
                 if has_work:
                     gB = cute.local_tile(
-                        cute.domain_offset((query_start * NUM_HEADS, 0, 0), mB_nkl),
+                        cute.domain_offset((query_start * num_heads, 0, 0), mB_nkl),
                         cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None),
                     )
                     tBsB, tBgB = cpasync.tma_partition(
                         tma_atom_b, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3),
                         cute.group_modes(thr_mma.partition_B(gB), 0, 3),
                     )
-                    gW = cute.local_tile(cute.domain_offset((query_start, 0), mW), (BLOCK_Q, NUM_HEADS), (None, None))
+                    gW = cute.local_tile(cute.domain_offset((query_start, 0), mW), (block_q, num_heads), (None, None))
                     tWsW, tWgW = cpasync.tma_partition(
                         tma_atom_w, 0, cute.make_layout(1), cute.group_modes(sW, 0, 2), cute.group_modes(gW, 0, 2)
                     )
@@ -457,6 +463,9 @@ class RefineSm100:
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         wg = warp_idx // 4
         key = tidx % 128
+        block_q = self.block_q
+        num_heads = self.num_heads
+        rows_per_subtile = block_q // NUM_EPI_SUBTILES
         epi_sub_mn = (BLOCK_KV, self.N // NUM_EPI_SUBTILES)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.mma_tiler, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, (BLOCK_KV, 32), False
@@ -472,21 +481,26 @@ class RefineSm100:
         lane_mask = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
         cap = mCandVal.layout.shape[1]
 
-        w_cache = cute.make_rmem_tensor(cute.make_layout((BLOCK_Q, NUM_W_IN_REG), stride=(NUM_W_IN_REG, 1)), Float32)
+        w_in_reg = self.w_in_reg
+        w_cache = cute.make_rmem_tensor(cute.make_layout((block_q, w_in_reg), stride=(w_in_reg, 1)), Float32)
         if has_work:
             cute.arch.mbarrier_wait(count_bar, 0)
             n = sCounts[0]
             tiles = (n + BLOCK_KV - 1) // BLOCK_KV
             cute.arch.mbarrier_wait(q_bar, 0)
-            # The warp's replica of the weights (lane = head): x + |x| heads w / 2, integer-ReLU heads w.
+            # The warp's replica of the weights (lane = head within a 32-head block; a 64-head tile
+            # replicates two blocks). x + |x| heads w / 2, integer-ReLU heads w; the factor's lane
+            # test holds for both blocks.
             factor = Float32(0.5)
             if (lane // 4) % 4 == 2:
                 factor = Float32(1.0)
-            for r in cutlass.range_constexpr(BLOCK_Q):
-                sWarpWeights[(warp_idx, r, lane)] = sW[(r, lane, 0)] * factor
+            for head_block in cutlass.range_constexpr(0, num_heads, 32):
+                head = head_block + lane
+                for r in cutlass.range_constexpr(block_q):
+                    sWarpWeights[(warp_idx, r, head)] = sW[(r, head, 0)] * factor
             cute.arch.sync_warp()
-            for r in cutlass.range_constexpr(BLOCK_Q):
-                for h in cutlass.range_constexpr(NUM_W_IN_REG):
+            for r in cutlass.range_constexpr(block_q):
+                for h in cutlass.range_constexpr(w_in_reg):
                     w_cache[(r, h)] = sWarpWeights[(warp_idx, r, h)]
 
             for t in cutlass.range(wg, tiles, 2, unroll=1):
@@ -511,9 +525,9 @@ class RefineSm100:
                         cute.arch.sync_warp()
                         if lane == 0:
                             cute.arch.mbarrier_arrive(empty_tmem + wg)
-                    red.extend(self._fast_sums(acc, w_cache, sWarpWeights, warp_idx, 2 * e))
+                    red.extend(self._fast_sums(acc, w_cache, sWarpWeights, warp_idx, rows_per_subtile * e, rows_per_subtile))
                 masks = []
-                for r in cutlass.range_constexpr(0, BLOCK_Q, 2):
+                for r in cutlass.range_constexpr(0, block_q, 2):
                     raw = cute.arch.mul_packed_f32x2((scale, scale), (red[r], red[r + 1]), rnd=_RND_RN)
                     for i in cutlass.range_constexpr(2):
                         row = r + i
@@ -523,14 +537,14 @@ class RefineSm100:
                         masks.append((cutlass.Uint32(cute.arch.vote_ballot_sync(take)), raw[i]))
                 # Every row's slots in one round trip: lane r reserves row r's.
                 lane_rows = cutlass.Uint32(0)
-                for r in cutlass.range_constexpr(BLOCK_Q):
+                for r in cutlass.range_constexpr(block_q):
                     lane_rows = cutlass.Uint32(select_i32(lane == r, Int32(masks[r][0]), Int32(lane_rows)))
                 lane_base = Int32(0)
                 if lane_rows != cutlass.Uint32(0):
                     lane_base = atomic_add_global_i32(
                         mCandCnt.iterator.toint() + cutlass.Int64(query_start + lane) * 4, Int32(cute.arch.popc(lane_rows))
                     )
-                for r in cutlass.range_constexpr(BLOCK_Q):
+                for r in cutlass.range_constexpr(block_q):
                     m, raw_r = masks[r]
                     if m != cutlass.Uint32(0):
                         base = cute.arch.shuffle_sync(lane_base, r)
@@ -554,15 +568,16 @@ class RefineSm100:
         tmem.free(tmem_ptr)
 
     @cute.jit
-    def _fast_sums(self, acc, w_cache, sWarpWeights, warp, t0):
-        """The subtile's two rows' head sums, in scan_sm100.py's order."""
+    def _fast_sums(self, acc, w_cache, sWarpWeights, warp, t0, rows):
+        """The subtile's rows' head sums, in scan_sm100.py's order (one row at 64 heads, two at 32)."""
+        num_heads = self.num_heads
         out = []
-        for r in cutlass.range_constexpr(2):
+        for r in cutlass.range_constexpr(rows):
             t = t0 + r
             s0 = (Float32(0.0), Float32(0.0))
             s1 = (Float32(0.0), Float32(0.0))
-            for h in cutlass.range_constexpr(0, NUM_HEADS, 4):
-                n0 = r * NUM_HEADS + h
+            for h in cutlass.range_constexpr(0, num_heads, 4):
+                n0 = r * num_heads + h
                 if cutlass.const_expr((h // 4) % 4 != 2):
                     a01 = cute.arch.add_packed_f32x2((acc[n0], acc[n0 + 1]), (abs_f32(acc[n0]), abs_f32(acc[n0 + 1])))
                     a23 = cute.arch.add_packed_f32x2(
@@ -580,6 +595,6 @@ class RefineSm100:
 
     @cute.jit
     def _weight(self, w_cache, sWarpWeights, warp, t, h: cutlass.Constexpr):
-        if cutlass.const_expr(h < NUM_W_IN_REG):
+        if cutlass.const_expr(h < self.w_in_reg):
             return w_cache[(t, h)]
         return sWarpWeights[(warp, t, h)]

@@ -27,20 +27,21 @@
 # never has per-split capacity; a dense variant writes every in-window score; all other modes,
 # dtypes and the paged path are removed.
 
-"""SM100 FlashTopK scan in CuTe DSL: FP8 or BF16, 32 heads, head_dim 128, 8-row query tiles.
+"""SM100 FlashTopK scan in CuTe DSL: FP8 or BF16, 32 or 64 heads, head_dim 128, query tiles of SCAN_N / heads rows
+(8 at 32 heads, 4 at 64), so the MMA N is 256 at both head counts.
 
-A CTA scans one 8-row query tile over the union of its rows' KV windows, clipped to its KV
+A CTA scans one query tile over the union of its rows' KV windows, clipped to its KV
 split, and appends every key whose score passes the row's raw gate to the row's candidate
 buffer as (-score, kv index). Warp roles (512 threads):
 
   * warps 0-7, two math warpgroups: group w reduces the blocks 2i + w from its own TMEM
-    accumulator, scores all 8 rows of a key per thread in a fixed order (heads 4j .. 4j + 3
+    accumulator, scores all the tile's rows of a key per thread in a fixed order (heads 4j .. 4j + 3
     in two packed FMA chains, their sum, then the kv scale) and writes them to its shared
     score plane;
   * warps 8-9, TMA: Q and weights once, then group w's KV blocks and FP8 scales;
   * warp 10, UMMA: one M=128 x N=256 x K=128 MMA per block, both groups;
-  * warps 12-15, store: warp s owns rows s and s + 4; per pair of blocks each lane gates four
-    consecutive keys of each block and the warp appends the hits in ballot order.
+  * warps 12-15, store: warp s owns rows s and s + 4 (row s alone at 64 heads); per pair of blocks each lane gates
+    four consecutive keys of each block and the warp appends the hits in ballot order.
 
 The dense variant scores the shared calibration sample and the rows recovery rescores: every
 key of a row's window is written to cand_val[row, key] (no gate, no counts), in the scan's bits.
@@ -60,17 +61,16 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .common import abs_f32, atomic_add_global_i32, fp32_to_i32_bits, loose_raw_gate, select_i32, store_global_b32
+from .common import (NEXT_N, NUM_HEADS, SCAN_N, abs_f32, atomic_add_global_i32, fp32_to_i32_bits, loose_raw_gate,
+                     select_i32, store_global_b32)
 
 _RND_RN = "rn"
 
 BLOCK_KV = 128
-NEXT_N = 8
-NUM_HEADS = 32
 HEAD_DIM = 128
 NUM_KV_STAGES = 3
 NUM_EPI_SUBTILES = 4
-NUM_W_IN_REG = 16
+NUM_W_IN_REG = 16  # weights per row a math thread keeps in registers at 32 heads: rows * this = 128 at either count
 NUM_MATH_WG = 2
 NUM_STORE_WARPS = 4
 
@@ -150,15 +150,17 @@ class ScanSm100:
     """The FlashTopK scan for one split kind (one split, or KV splits), operand type (FP8 with per-key
     scales, or BF16) and output (candidates, or every score of the windows: dense)."""
 
-    def __init__(self, *, single_split: bool, bf16: bool = False, dense: bool = False):
+    def __init__(self, *, single_split: bool, bf16: bool = False, dense: bool = False, num_heads: int = NUM_HEADS):
         self.single_split = single_split and not dense
         self.bf16 = bf16
         self.dense = dense
         self.block_kv = BLOCK_KV
-        self.next_n = NEXT_N
-        self.num_heads = NUM_HEADS
+        self.next_n = SCAN_N // num_heads
+        self.num_heads = num_heads
         self.head_dim = HEAD_DIM
-        self.N = NEXT_N * NUM_HEADS
+        self.N = SCAN_N
+        # The register weight cache: 128 floats a thread, so 16 heads of 8 rows at 32 heads, 32 heads of 4 at 64.
+        self.w_in_reg = min(num_heads, NUM_W_IN_REG * NEXT_N // self.next_n)
         # A BF16 KV stage is twice an FP8 one: two stages per ring keep shared memory under 227 KB.
         self.num_kv_stages = 2 if bf16 else NUM_KV_STAGES
         self.num_umma_stages = 1
@@ -755,21 +757,26 @@ class ScanSm100:
         tTR_rAcc = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
         m_coord = tTR_cC[0][0]
 
-        w_cache = cute.make_rmem_tensor(cute.make_layout((next_n, NUM_W_IN_REG), stride=(NUM_W_IN_REG, 1)), Float32)
+        w_in_reg = self.w_in_reg
+        w_cache = cute.make_rmem_tensor(cute.make_layout((next_n, w_in_reg), stride=(w_in_reg, 1)), Float32)
         if has_work:
             q_pipeline.consumer_wait(q_cons_state)
-            # A warp-private replica of the tile's weights (lane = head). Heads on the
-            # x + |x| = 2 relu(x) path take w / 2, integer-ReLU heads w; either product is
-            # exactly relu(x) * w.
+            # A warp-private replica of the tile's weights (lane = head within a 32-head block;
+            # a 64-head tile replicates two blocks). Heads on the x + |x| = 2 relu(x) path take
+            # w / 2, integer-ReLU heads w; either product is exactly relu(x) * w. The factor's
+            # lane test holds for both blocks, since (head // 4) % 4 == (lane // 4) % 4 when the
+            # block base is a multiple of 32.
             cute.arch.sync_warp()
             weight_factor = Float32(0.5)
             if (weight_lane // 4) % 4 == 2:
                 weight_factor = Float32(1.0)
-            for weight_row in cutlass.range_constexpr(next_n):
-                sWarpWeights[(weight_warp, weight_row, weight_lane)] = sW[(weight_row, weight_lane, 0)] * weight_factor
+            for head_block in cutlass.range_constexpr(0, self.num_heads, 32):
+                head = head_block + weight_lane
+                for weight_row in cutlass.range_constexpr(next_n):
+                    sWarpWeights[(weight_warp, weight_row, head)] = sW[(weight_row, head, 0)] * weight_factor
             cute.arch.sync_warp()
             for t_i in cutlass.range_constexpr(next_n):
-                for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                for w_j in cutlass.range_constexpr(w_in_reg):
                     w_cache[(t_i, w_j)] = sWarpWeights[(weight_warp, t_i, w_j)]
 
         num_epi_subtiles = self.num_epi_subtiles
@@ -839,7 +846,7 @@ class ScanSm100:
                     a1 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 1]), Int32(0)))
                     a2 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 2]), Int32(0)))
                     a3 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 3]), Int32(0)))
-                if cutlass.const_expr(h < NUM_W_IN_REG):
+                if cutlass.const_expr(h < self.w_in_reg):
                     w0, w1, w2, w3 = w_cache[(t, h)], w_cache[(t, h + 1)], w_cache[(t, h + 2)], w_cache[(t, h + 3)]
                 else:
                     w0 = sWarpWeights[(weight_warp, t, h)]

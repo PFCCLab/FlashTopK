@@ -35,11 +35,12 @@ On a full prefill, FlashTopK is 1.7-3.3x faster than dense scoring + FlashInfer 
 
 ### Install
 
-FlashTopK needs Python 3.10+, PyTorch 2.6+, Triton 3.3+ and CuTe DSL (`nvidia-cutlass-dsl`) 4.5+. SM100 GPUs also need a CUDA 12.8+ driver.
+FlashTopK needs Python 3.10+, Triton 3.3+ and CuTe DSL (`nvidia-cutlass-dsl`) 4.5+. SM100 GPUs also need a CUDA 12.8+ driver. PyTorch 2.6+ is optional: the package also runs on PaddlePaddle tensors under `paddle.enable_compat(scope={"flashtopk"})` (see `flashtopk.indexer_topk` in [docs/api.md](docs/api.md)).
 
 ```bash
-pip install -e .            # torch >= 2.6, triton >= 3.3, nvidia-cutlass-dsl >= 4.5, apache-tvm-ffi
-pip install -e .[test]      # pytest for the test suite
+pip install -e .            # triton >= 3.3, nvidia-cutlass-dsl >= 4.5, apache-tvm-ffi
+pip install -e .[torch]     # + torch >= 2.6, to run on PyTorch tensors
+pip install -e .[test]      # pytest (and torch) for the test suite
 ```
 
 ### Quick start

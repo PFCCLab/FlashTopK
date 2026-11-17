@@ -10,14 +10,16 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.6",
     "triton>=3.3",
     "nvidia-cutlass-dsl>=4.5",
     "apache-tvm-ffi",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+# FlashTopK also runs on PaddlePaddle tensors through `paddle.enable_compat(scope={"flashtopk"})`, so PyTorch is not a
+# requirement of a plain install: paddlefleet_ops vendors this package into a Paddle environment that has no torch.
+torch = ["torch>=2.6"]
+test = ["pytest", "torch>=2.6"]
 
 [tool.setuptools.packages.find]
 include = ["flashtopk*"]

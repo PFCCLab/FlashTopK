@@ -5,7 +5,7 @@ score is below the row's k-th by more than a relative 1e-5 (a tie under the othe
 
 import pytest
 import torch
-from conftest import TOPK, make_call, requires_gpu
+from conftest import TOPK, gpu_arch, make_call, requires_gpu
 
 import flashtopk
 
@@ -41,10 +41,13 @@ def deep_gemm_logits(q, kv, scales, weights, ks, ke):
     return logits[:, : kv.shape[0]].float()
 
 
-@pytest.mark.parametrize("pruning", ["off", "adaptive"])
-def test_bf16_against_torch(pruning):
-    q, kv, s, w, ks, ke = make_call(64, 8192, torch.bfloat16, seed=21, windows="causal")
-    indices = flashtopk.Selector(TOPK, dtype=torch.bfloat16, pruning=pruning).run(q, kv, w, ks, ke, s)
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("pruning", ["off", "always", "adaptive"])
+def test_bf16_against_torch(pruning, heads):
+    if heads == 64 and gpu_arch() != 10:
+        pytest.skip("64 heads need an SM100 GPU")
+    q, kv, s, w, ks, ke = make_call(64, 8192, torch.bfloat16, seed=21, windows="causal", heads=heads)
+    indices = flashtopk.Selector(TOPK, num_heads=heads, dtype=torch.bfloat16, pruning=pruning).run(q, kv, w, ks, ke, s)
     logits = torch_logits(q, kv, w, ks, ke)
     kth = torch.topk(logits, TOPK, dim=1).values[:, -1]
     assert wrong_rows(indices, logits, kth) == 0

@@ -19,13 +19,13 @@ requires_gpu = pytest.mark.skipif(gpu_arch() not in (9, 10), reason="needs an SM
 DTYPES = [pytest.param(torch.float8_e4m3fn, id="fp8"), pytest.param(torch.bfloat16, id="bf16")]
 
 
-def make_call(rows, seq_len_kv, dtype, seed=0, windows="causal", spread=1.0):
+def make_call(rows, seq_len_kv, dtype, seed=0, windows="causal", spread=1.0, heads=32):
     """A synthetic call: Gaussian q / kv, weights of both signs, kv scales for FP8. windows: "causal" (the rows
-    are the last of the keys), "random" (any [ks, ke), some empty), or "short" (shorter than TOPK)."""
+    are the last of the keys), "random" (any [ks, ke), some empty), or "short" (shorter than TOPK). heads: 32 or 64."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    q = torch.randn(rows, 32, 128, generator=g, device="cuda") * spread
+    q = torch.randn(rows, heads, 128, generator=g, device="cuda") * spread
     kv = torch.randn(seq_len_kv, 128, generator=g, device="cuda")
-    weights = torch.randn(rows, 32, generator=g, device="cuda") * 0.1
+    weights = torch.randn(rows, heads, generator=g, device="cuda") * 0.1
     if windows == "causal":
         ke = torch.arange(seq_len_kv - rows + 1, seq_len_kv + 1, device="cuda").clamp(min=1).int()
         ks = torch.zeros(rows, dtype=torch.int32, device="cuda")

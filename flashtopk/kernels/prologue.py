@@ -50,11 +50,14 @@ class SampleWindows:
             mHi[r] = samples_below(mKe[r], seq_len_kv, samples)
 
 
-EST_GROUP = 8  # the refine's row group (refine_sm90 / refine_sm100 BLOCK_Q)
+EST_GROUP = 8  # the refine's row group at 32 heads (refine_sm90 / refine_sm100 tile); 64 heads take rows_for(64) = 4
 EST_WORDS = 16  # an estimate row's in-window mask over the 256 sample keys (8 words), then its past-the-gate mask
 
 
 class Decide:
+    def __init__(self, group: int = EST_GROUP):
+        self.group = group
+
     @cute.jit
     def __call__(self, est: cute.Tensor, ks: cute.Tensor, ke: cute.Tensor, scan_ks: cute.Tensor,
                  prune_ks: cute.Tensor, flag: cute.Tensor, estimate: cute.Tensor, num_q: Int32, threshold: Float32,
@@ -69,7 +72,8 @@ class Decide:
         smem = utils.SmemAllocator()
         sWin = smem.allocate_tensor(Float32, cute.make_layout((WARPS,)), 16)
         sPass = smem.allocate_tensor(Float32, cute.make_layout((WARPS,)), 16)
-        groups = mEst.layout.shape[0] // EST_GROUP
+        group = self.group
+        groups = mEst.layout.shape[0] // group
         half = EST_WORDS // 2
         # Each group's union, its rows' masks or-ed, counted over its in-window samples: the refine's work is a
         # group's union over its window, so the groups pool (counts are exact in FP32 below 2^24).
@@ -79,9 +83,9 @@ class Decide:
             for w in cutlass.range_constexpr(half):
                 win = Int32(0)
                 kept = Int32(0)
-                for r in cutlass.range_constexpr(EST_GROUP):
-                    win = win | mEst[(g * EST_GROUP + r, w)]
-                    kept = kept | mEst[(g * EST_GROUP + r, half + w)]
+                for r in cutlass.range_constexpr(group):
+                    win = win | mEst[(g * group + r, w)]
+                    kept = kept | mEst[(g * group + r, half + w)]
                 n_win = n_win + Float32(cute.arch.popc(win))
                 n_pass = n_pass + Float32(cute.arch.popc(kept))
         n_win = cute.arch.warp_reduction_sum(n_win)

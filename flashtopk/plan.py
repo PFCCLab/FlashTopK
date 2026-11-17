@@ -45,6 +45,7 @@ import triton
 import triton.language as tl
 
 from .kernels import launch
+from .kernels.common import rows_for
 from .kernels.prologue import EST_GROUP, EST_WORDS
 
 # The pruning kernels' columns per row: the retained heads and the negative aggregate's two rows.
@@ -84,6 +85,26 @@ def _operand_row(row, col, LAYOUT: tl.constexpr):
 
 
 @triton.jit
+def _sum_all(x, R2: tl.constexpr):
+    """Sum of a rank-1 `x` as a one-element tensor. R2 (an SM100 64-head call): reduce an [n, 1] operand -- the product
+    stays in TMEM and Triton 3.6's TMEM layout pass then asks for a slice layout of every full reduction among its
+    users, which a rank-1 operand aborts ("parent layout must have at least rank >= 2"). Else the plain rank-1
+    reduction, whose tree the 32-head plan's results and margins were measured with; the zero add only gives the two
+    branches the same shape."""
+    if R2 == 1:
+        return tl.sum(x[:, None], axis=0)
+    return tl.sum(x, axis=0) + tl.zeros([1], x.dtype)
+
+
+@triton.jit
+def _max_all(x, R2: tl.constexpr):
+    """``max(x)`` as a one-element tensor, reduced as in _sum_all (a max's tree cannot round)."""
+    if R2 == 1:
+        return tl.max(x[:, None], axis=0)
+    return tl.max(x, axis=0) + tl.zeros([1], x.dtype)
+
+
+@triton.jit
 def _estimate_row(row, G: tl.constexpr, stride):
     """Whether `row` is in one of the estimate's row groups (the first of every `stride` groups of G rows)."""
     return (row // G) % stride == 0
@@ -119,6 +140,7 @@ def _plan_kernel(
     G: tl.constexpr,
     BF16: tl.constexpr,  # bf16 operands: the aggregate as two bf16 rows (scale 1)
     LAYOUT: tl.constexpr,  # the operand's layout (_operand_row)
+    R2: tl.constexpr,  # full reductions as [1] (_sum_all): SM100 with H = 64
 ):
     pid = tl.program_id(0).to(tl.int64)
     row = pid
@@ -153,7 +175,7 @@ def _plan_kernel(
     ke = tl.load(ENDS + row)
     inwin = (cols >= ks) & (cols < ke)
     act = tl.dot(q8, tl.trans(k8)) > 0
-    n_in = tl.sum(inwin.to(tl.float32), axis=0)
+    n_in = _sum_all(inwin.to(tl.float32), R2)
     p = tl.sum((act & inwin[None, :]).to(tl.float32), axis=1) / tl.maximum(n_in, 1.0)
     p = tl.where(n_in > 0, p, 0.5)
 
@@ -162,7 +184,7 @@ def _plan_kernel(
     pos = w > 0
     neg = w < 0
     strength = tl.where(pos, w * qn, -w * qn * tl.minimum(p, 1.0 - p))
-    tier = tl.where(pos, 2.0, 0.0) + strength / (tl.max(strength, axis=0) + 1e-30)
+    tier = tl.where(pos, 2.0, 0.0) + strength / (_max_all(strength, R2) + 1e-30)
     tier = tl.where(pos | neg, tier, -1.0)
     hh = h[None, :]
     ahead = (tier[None, :] > tier[:, None]) | ((tier[None, :] == tier[:, None]) & (hh < h[:, None]))
@@ -180,8 +202,8 @@ def _plan_kernel(
     # 2^-16 of the same, so the sum over pairs is within 2^-14 e_sep^2 -- a quarter of the 2^-12 e_sep^2 added under
     # the root. (FP32 dot products here ran 4x slower than the rest of the plan on SM90.)
     wt = tl.where(kept, w, 0.0)
-    e = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0)
-    if tl.sum(omit_pos.to(tl.int32), axis=0) > 0:
+    e = _sum_all(tl.zeros([H], dtype=tl.float32), R2)
+    if _sum_all(omit_pos.to(tl.int32), R2) > 0:
         qb = q8.to(tl.bfloat16)
         gram = tl.dot(qb, tl.trans(qb))  # [H, H]
         gain = tl.where(kept[None, :], tl.maximum(gram, 0.0) * tl.maximum(gram, 0.0) / tl.maximum(qn * qn, 1e-30)[None, :],
@@ -195,11 +217,11 @@ def _plan_kernel(
         q_anchor = tl.load(Q + row * H * 128 + anchor[:, None] * 128 + d[None, :]).to(tl.float32)
         v = tl.where(omit_pos[:, None], w[:, None] * (q - alpha[:, None] * q_anchor), 0.0)
         vn = tl.sqrt(tl.sum(v * v, axis=1))
-        e_sep = tl.sum(vn, axis=0)
+        e_sep = _sum_all(vn, R2)
         v0 = v.to(tl.bfloat16)
         v1 = (v - v0.to(tl.float32)).to(tl.bfloat16)
         gv = tl.dot(v0, tl.trans(v0)) + (tl.dot(v0, tl.trans(v1)) + tl.dot(v1, tl.trans(v0)))
-        e_joint = tl.sqrt(tl.sum(tl.sum(tl.maximum(gv, 0.0), axis=1), axis=0) + 2.0**-12 * e_sep * e_sep)
+        e_joint = tl.sqrt(_sum_all(tl.sum(tl.maximum(gv, 0.0), axis=1), R2) + 2.0**-12 * e_sep * e_sep)
         e = tl.minimum(e_sep, e_joint)
 
     # The negative aggregate as two rows of the operand type: the high part and its rounding error, over
@@ -207,23 +229,23 @@ def _plan_kernel(
     agg = tl.where(omit_neg & (p >= 0.5), -w, 0.0)
     a = tl.sum(agg[:, None] * q, axis=0)
     if BF16:
-        scale_hi = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0) + 1.0
+        scale_hi = _sum_all(tl.zeros([H], dtype=tl.float32), R2) + 1.0
         scale_lo = scale_hi
         a8_hi = a.to(tl.bfloat16)
         hi = a8_hi.to(tl.float32)
         a8_lo = (a - hi).to(tl.bfloat16)
         lo = a8_lo.to(tl.float32)
     else:
-        scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a), axis=0), 1e-30) / 448.0)))
+        scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(_max_all(tl.abs(a), R2), 1e-30) / 448.0)))
         a8_hi = (a / scale_hi).to(tl.float8e4nv)
         hi = a8_hi.to(tl.float32) * scale_hi
-        scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a - hi), axis=0), 1e-30) / 448.0)))
+        scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(_max_all(tl.abs(a - hi), R2), 1e-30) / 448.0)))
         a8_lo = ((a - hi) / scale_lo).to(tl.float8e4nv)
         lo = a8_lo.to(tl.float32) * scale_lo
-    quant = tl.sqrt(tl.sum((a - hi - lo) * (a - hi - lo), axis=0))
-    an = tl.sqrt(tl.sum(hi * hi, axis=0)) + tl.sqrt(tl.sum(lo * lo, axis=0))
+    quant = tl.sqrt(_sum_all((a - hi - lo) * (a - hi - lo), R2))
+    an = tl.sqrt(_sum_all(hi * hi, R2)) + tl.sqrt(_sum_all(lo * lo, R2))
 
-    mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + e
+    mass = _sum_all(tl.abs(w) * qn, R2) + _sum_all(tl.abs(wt) * qn, R2) + an + e
     allow = (e + quant) * (1.0 + 2.0**-20) + rounding * mass
     allow = tl.where(allow < float("inf"), allow, float("inf"))
 
@@ -255,9 +277,9 @@ def _plan_kernel(
     tl.store(QS + _operand_row(row, R, LAYOUT) * 128 + d, a8_hi)
     tl.store(QS + _operand_row(row, R + 1, LAYOUT) * 128 + d, a8_lo)
     tl.store(WS + row * (R + 2) + slot, wt, mask=kept)
-    tl.store(WS + row * (R + 2) + R, scale_hi)
-    tl.store(WS + row * (R + 2) + R + 1, scale_lo)
-    tl.store(ALLOW + row, allow)
+    tl.store(WS + row * (R + 2) + R + tl.arange(0, 1), scale_hi)
+    tl.store(WS + row * (R + 2) + R + 1 + tl.arange(0, 1), scale_lo)
+    tl.store(ALLOW + row + tl.arange(0, 1), allow)
 
 
 @triton.jit
@@ -282,7 +304,7 @@ def _key_norm_kernel(KV, SCALES, OUT, n, n_out, FLAG, BLOCK: tl.constexpr, GATED
 def key_norms(plan, kv: torch.Tensor, flag: Optional[torch.Tensor] = None) -> None:
     """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); a grid of a few programs an SM, so
     a gated launch the call does not need costs little."""
-    n_out = plan.knsc.numel()
+    n_out = int(plan.knsc.numel())
     grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
     _key_norm_kernel[(grid,)](kv, plan.scales_or(kv), plan.knsc, kv.shape[0], n_out,
                               plan.knsc if flag is None else flag, BLOCK=64, GATED=flag is not None,
@@ -304,12 +326,17 @@ class _Plan:
         nk = kv.shape[0]
         dev = q.device
         self.layout = 2 if torch.cuda.get_device_capability(dev)[0] == 9 else 1
+        # A 64-head product (M = 64) is an SM100 tcgen05 MMA, whose TMEM layout pass aborts on a rank-1 full reduction
+        # of its users; those calls reduce [n, 1] operands instead (_sum_all). That only reassociates the same terms:
+        # a few ulps against _PLAN_ROUNDING's gamma_33 of the weight mass.
+        self.r2 = heads >= 64 and torch.cuda.get_device_capability(dev)[0] == 10
         group = 16 if self.layout == 2 else 2
         self.padded = triton.cdiv(num_q, group) * group
         self.q_prune = torch.empty(self.padded * PRUNE_COLUMNS, dim, dtype=q.dtype, device=dev)
         self.w_prune = torch.empty(num_q, PRUNE_COLUMNS, dtype=torch.float32, device=dev)
         self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
-        self.est_rows = estimate_rows(num_q)
+        self.est_group = rows_for(heads)  # the refine's tile: 8 rows at 32 heads, 4 at 64
+        self.est_rows = estimate_rows(num_q, self.est_group)
         self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
         if th_bucket is None:
             origin = torch.zeros(num_q, dtype=torch.float32, device=dev)
@@ -342,8 +369,9 @@ class _Plan:
             q, weights, self.k_samples, self.s_samples, self.knsc_samples, self.cols, ks, ke, origin, inv_delta,
             th_bucket, self.q_prune, self.w_prune, self.allowance, self.est, ks if flag is None else flag,
             num_q, self.padded, SCREEN_ROUNDING + _PLAN_ROUNDING, int(estimate), int(flag is not None),
-            estimate_stride(num_q), H=q.shape[1], R=PRUNE_COLUMNS - 2, S=_PLAN_SAMPLES, G=EST_GROUP, BF16=self.bf16,
-            LAYOUT=self.layout, num_warps=4,
+            estimate_stride(num_q, self.est_group), H=q.shape[1], R=PRUNE_COLUMNS - 2, S=_PLAN_SAMPLES,
+            G=self.est_group, BF16=self.bf16,
+            LAYOUT=self.layout, R2=int(self.r2), num_warps=4,
         )
 
     def scales_or(self, kv: torch.Tensor) -> torch.Tensor:
@@ -354,21 +382,22 @@ class _Plan:
         return self.q_prune, self.w_prune, self.allowance, self.knsc, self.est
 
 
-def estimate_stride(num_q: int) -> int:
-    """The estimate takes the first of every this many row groups: EST_GROUPS, or more past EST_MAX_GROUPS groups."""
-    return max(EST_GROUPS, triton.cdiv(triton.cdiv(num_q, EST_GROUP), EST_MAX_GROUPS))
+def estimate_stride(num_q: int, group: int = EST_GROUP) -> int:
+    """The estimate takes the first of every this many row groups (of `group` rows, the refine's tile): EST_GROUPS,
+    or more past EST_MAX_GROUPS groups."""
+    return max(EST_GROUPS, triton.cdiv(triton.cdiv(num_q, group), EST_MAX_GROUPS))
 
 
-def estimate_rows(num_q: int) -> int:
-    """Rows the estimate plans: EST_GROUP for each of its groups (the first of every estimate_stride)."""
-    return triton.cdiv(triton.cdiv(num_q, EST_GROUP), estimate_stride(num_q)) * EST_GROUP
+def estimate_rows(num_q: int, group: int = EST_GROUP) -> int:
+    """Rows the estimate plans: `group` for each of its groups (the first of every estimate_stride)."""
+    return triton.cdiv(triton.cdiv(num_q, group), estimate_stride(num_q, group)) * group
 
 
-def estimate_shares(est: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def estimate_shares(est: torch.Tensor, group: int = EST_GROUP) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(union, row)`` from the estimate's masks, both 0-dim FP32 tensors: over the estimate groups' in-window
     samples, the share that passes some row's gate of the group (what the decision uses), and over the estimate
     rows' in-window samples, the share that passes the row's own gate. Without in-window samples, 1."""
-    words = est.view(-1, EST_GROUP, EST_WORDS)
+    words = est.view(-1, group, EST_WORDS)
     bits = (words.unsqueeze(-1) >> torch.arange(32, device=est.device, dtype=torch.int32)) & 1
     win, passed = bits[:, :, : EST_WORDS // 2], bits[:, :, EST_WORDS // 2:]
 
@@ -442,7 +471,7 @@ def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_b
     plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
     plan.rows(num_q, True, None)
     threshold = adaptive_threshold(q.device.index, kv_scales is None, kv.shape[0])
-    launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate)
+    launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate, plan.est_group)
     return plan
 
 

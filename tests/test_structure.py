@@ -4,7 +4,7 @@ works as a custom op under torch.compile, and rejects operands it cannot take.""
 
 import pytest
 import torch
-from conftest import DTYPES, TOPK, assert_same, canonical_topk, dense_scores, make_call, requires_gpu
+from conftest import DTYPES, TOPK, assert_same, canonical_topk, dense_scores, gpu_arch, make_call, requires_gpu
 
 import flashtopk
 from flashtopk import topk as topk_mod
@@ -226,21 +226,25 @@ def test_rejects():
     with pytest.raises(ValueError):
         sel.run(q, kv, w[:, :16], ks, ke, s)
     with pytest.raises(ValueError):
-        flashtopk.Selector(TOPK, num_heads=64)
+        flashtopk.Selector(TOPK, num_heads=48)
     with pytest.raises(ValueError):
         flashtopk.Selector(TOPK, pruning="sometimes")
     assert flashtopk.supported(q, kv) and not flashtopk.supported(q[:, :, :64])
 
 
+@pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [5, 300, 2100, 20000])
-def test_group_estimate(dtype, rows):
-    """The device's group estimate is the torch reference's (plan.estimate_shares, pooled over the groups), its masks
-    pack each estimate row's in-window samples, and the flag is the estimate against the threshold."""
+def test_group_estimate(dtype, rows, heads):
+    """The device's group estimate is the torch reference's (plan.estimate_shares, pooled over the groups of the
+    refine's rows), its masks pack each estimate row's in-window samples, and the flag is the estimate against the
+    threshold."""
     from flashtopk import plan as planner
 
-    q, kv, s, w, ks, ke = make_call(rows, 30000, dtype, seed=46, windows="random")
-    sel = flashtopk.Selector(TOPK, dtype=dtype, pruning="off")
+    if heads == 64 and gpu_arch() != 10:
+        pytest.skip("64 heads need an SM100 GPU")
+    q, kv, s, w, ks, ke = make_call(rows, 30000, dtype, seed=46, windows="random", heads=heads)
+    sel = flashtopk.Selector(TOPK, num_heads=heads, dtype=dtype, pruning="off")
     sel.run(q, kv, w, ks, ke, s)
     n = q.shape[0]
     flag = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -248,13 +252,14 @@ def test_group_estimate(dtype, rows):
     scan_ks, prune_ks = torch.empty_like(ks), torch.empty_like(ks)
     plan = planner.adaptive_estimate(q, w, kv, s, ks, ke, sel._origin[:n], sel._inv_delta[:n], sel._th_bucket[:n],
                                      flag, scan_ks, prune_ks, estimate)
-    union, row = planner.estimate_shares(plan.est)
+    g = plan.est_group
+    union, row = planner.estimate_shares(plan.est, g)
     assert abs(float(estimate[0]) - float(union)) <= 1e-6
     assert 0.0 <= float(row) <= 1.0 and 0.0 <= float(union) <= 1.0
     threshold = planner.adaptive_threshold(q.device.index, s is None, kv.shape[0])
     assert bool(flag[0]) == (float(estimate[0]) <= threshold)
-    stride = planner.estimate_stride(n)
-    rows_est = [(e // 8) * 8 * stride + e % 8 for e in range(plan.est_rows)]
+    stride = planner.estimate_stride(n, g)
+    rows_est = [(e // g) * g * stride + e % g for e in range(plan.est_rows)]
     bits = (plan.est[:, :8].unsqueeze(-1) >> torch.arange(32, device="cuda", dtype=torch.int32)) & 1
     for e, r in enumerate(rows_est):
         want = torch.zeros(256, dtype=torch.int32, device="cuda")

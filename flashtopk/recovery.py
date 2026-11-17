@@ -17,6 +17,7 @@ the output does not depend on which path produced it.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 
@@ -46,9 +47,17 @@ class Recovery:
     """One plan's recovery buffers, for up to `max_rows` rows and `max_kv` keys. `arena` is the call's float
     workspace (free once the selection has run), at least RECOVERY_ROWS * max_kv floats."""
 
-    def __init__(self, max_rows: int, max_kv: int, topk: int, dtype: torch.dtype, arena: torch.Tensor):
+    def __init__(self, max_rows: int, max_kv: int, topk: int, dtype: torch.dtype, arena: torch.Tensor,
+                 num_heads: int = NUM_HEADS, arena_elements: Optional[int] = None):
         dev = arena.device
-        if arena.numel() < RECOVERY_ROWS * max_kv:
+        self.num_heads = num_heads
+        # The arena's length as a Python int, from the caller that allocated it. Reading it back off the tensor
+        # (`int(arena.numel())`) is a device-to-host read of a 0-d CUDA tensor under Paddle's compat proxy, and that
+        # read waits for the stream -- i.e. for every kernel the call has already enqueued.
+        if arena_elements is None:
+            arena_elements = int(arena.numel())
+        self.arena_elements = int(arena_elements)
+        if self.arena_elements < RECOVERY_ROWS * max_kv:
             raise ValueError("the recovery arena must hold RECOVERY_ROWS rows of dense scores")
         i32 = dict(dtype=torch.int32, device=dev)
         words_per_head = HEAD_DIM * torch.empty((), dtype=dtype).element_size() // 4
@@ -57,8 +66,8 @@ class Recovery:
         self.row_map = torch.empty(RECOVERY_ROWS, **i32)
         self.slot_ks = torch.empty(RECOVERY_ROWS, **i32)
         self.slot_ke = torch.empty(RECOVERY_ROWS, **i32)
-        self.q_gather = torch.empty(RECOVERY_ROWS * NUM_HEADS * words_per_head, **i32)
-        self.w_gather = torch.empty(RECOVERY_ROWS, NUM_HEADS, dtype=torch.float32, device=dev)
+        self.q_gather = torch.empty(RECOVERY_ROWS * num_heads * words_per_head, **i32)
+        self.w_gather = torch.empty(RECOVERY_ROWS, num_heads, dtype=torch.float32, device=dev)
         self.whole_map = torch.empty(max_rows, **i32)
         self.whole_ks = torch.empty(max_rows, **i32)
         self.whole_ke = torch.empty(max_rows, **i32)
@@ -67,40 +76,70 @@ class Recovery:
         stage_rows = RECOVERY_ROWS * self.max_splits if self.max_splits > 1 else 0
         self.stage_scores = torch.empty(stage_rows, topk, dtype=torch.float32, device=dev)
         self.stage_indices = torch.empty(stage_rows, topk, **i32)
+        self._views: dict = {}
+
+    def _plan_views(self, num_q: int, seq_len_kv: int, sm90: bool, dtype: torch.dtype):
+        """The aliases of this plan's buffers that a call needs, built once per call shape: a call makes about twenty
+        of them, and under Paddle's compat proxy each slice or view is a framework call. The buffers are allocated
+        once, in this plan, so the views stay valid for the plan's lifetime."""
+        key = (num_q, seq_len_kv, sm90, dtype)
+        views = self._views.get(key)
+        if views is None:
+            # per-row: the gathered slots
+            q_slots = self.q_gather.view(dtype).view(RECOVERY_ROWS, self.num_heads, HEAD_DIM)
+            splits = min(self.max_splits, recovery_splits(seq_len_kv))
+            stage = RECOVERY_ROWS * splits
+            # whole call: `chunk` rows at a time
+            chunk = dense_rows(self.arena_elements, seq_len_kv, num_q)
+            seen: dict = {}
+            chunks = []
+            for off in range(0, num_q, chunk):
+                rows = min(chunk, num_q - off)
+                part = slice(off, off + rows)
+                if rows not in seen:
+                    dense = self.arena[: rows * seq_len_kv].view(rows, seq_len_kv)
+                    seen[rows] = (dense, dense.view(torch.int32), self.scratch[:rows])
+                dense, dense_i32, scratch = seen[rows]
+                chunks.append((part, dense, dense_i32, scratch, self.whole_ks[part], self.whole_ke[part],
+                               self.whole_map[part]))
+            slot_dense = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
+            views = self._views[key] = dict(
+                slots=(slot_dense, slot_dense.view(torch.int32), q_slots,
+                       launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None,
+                       self.scratch[:RECOVERY_ROWS], splits, stage,
+                       self.stage_scores[:stage], self.stage_indices[:stage]),
+                whole=(self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q]),
+                chunks=chunks, chunk=chunk)
+        return views
 
     def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices) -> None:
         """Enqueue the recovery of this call's selection (scores / indices, its health and bad-row table)."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         sm90 = launch.arch(q) == 9
+        views = self._plan_views(num_q, seq_len_kv, sm90, q.dtype)
+        whole_map, whole_ks, whole_ke = views["whole"]
         launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
-                      self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
+                      self.w_gather, whole_map, whole_ks, whole_ke)
 
         # per-row: the gathered slots
-        dense = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
-        q_slots = self.q_gather.view(q.dtype).view(RECOVERY_ROWS, NUM_HEADS, HEAD_DIM)
-        operand = launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None
-        launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense,
-                          self.scratch[:RECOVERY_ROWS], q_operand=operand)
-        splits = min(self.max_splits, recovery_splits(seq_len_kv))
+        dense, dense_i32, q_slots, operand, scratch, splits, stage, stage_scores, stage_indices = views["slots"]
+        launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense, scratch,
+                          q_operand=operand, out_i32=dense_i32)
         if splits > 1:
-            stage = RECOVERY_ROWS * splits
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
-                                self.stage_indices[:stage], splits)
-            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices)
+            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, stage_scores, stage_indices, splits,
+                                dense_i32=dense_i32)
+            launch.select_staged(stage_scores, stage_indices, self.row_map, scores, indices)
         else:
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices)
+            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices, dense_i32=dense_i32)
 
         # whole call, `chunk` rows at a time
-        chunk = dense_rows(self.arena.numel(), seq_len_kv, num_q)
         full_operand = launch.q_operand_sm90(q) if sm90 else None
-        for off in range(0, num_q, chunk):
-            rows = min(chunk, num_q - off)
-            dense = self.arena[: rows * seq_len_kv].view(rows, seq_len_kv)
-            part = slice(off, off + rows)
+        for part, dense, dense_i32, scratch, ks_part, ke_part, map_part in views["chunks"]:
             operand = None
-            if sm90:
-                operand = full_operand[off * NUM_HEADS: (off + math.ceil(rows / NEXT_N) * NEXT_N) * NUM_HEADS]
-            launch.scan_dense(q[part], kv, kv_scales, weights[part], self.whole_ks[part], self.whole_ke[part], dense,
-                              self.scratch[:rows], q_operand=operand)
-            launch.select_dense(dense, self.whole_ks[part], self.whole_ke[part], self.whole_map[part], scores,
-                                indices)
+            if sm90:  # the operand is laid out per call, so the slices are taken here rather than cached
+                rows = part.stop - part.start
+                operand = full_operand[part.start * NUM_HEADS:
+                                       (part.start + math.ceil(rows / NEXT_N) * NEXT_N) * NUM_HEADS]
+            launch.scan_dense(q[part], kv, kv_scales, weights[part], ks_part, ke_part, dense, scratch,
+                              q_operand=operand, out_i32=dense_i32)
+            launch.select_dense(dense, ks_part, ke_part, map_part, scores, indices, dense_i32=dense_i32)

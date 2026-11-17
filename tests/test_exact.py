@@ -4,7 +4,7 @@ arithmetic, so equality is bit for bit), on every path: the scan, pruning, adapt
 
 import pytest
 import torch
-from conftest import DTYPES, TOPK, assert_same, canonical_topk, dense_scores, make_call, requires_gpu
+from conftest import DTYPES, TOPK, assert_same, canonical_topk, dense_scores, gpu_arch, make_call, requires_gpu
 
 import flashtopk
 from flashtopk import topk as topk_mod
@@ -21,12 +21,34 @@ SHAPES = [
 ]
 
 
+@pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("rows,seq_len_kv,windows", SHAPES)
 @pytest.mark.parametrize("pruning", ["off", "always", "adaptive"])
-def test_exact(dtype, rows, seq_len_kv, windows, pruning):
-    q, kv, s, w, ks, ke = make_call(rows, seq_len_kv, dtype, seed=rows, windows=windows)
-    got = flashtopk.Selector(TOPK, dtype=dtype, pruning=pruning, return_scores=True).run(q, kv, w, ks, ke, s)
+def test_exact(dtype, rows, seq_len_kv, windows, pruning, heads):
+    if heads == 64 and gpu_arch() != 10:
+        pytest.skip("64 heads need an SM100 GPU")
+    q, kv, s, w, ks, ke = make_call(rows, seq_len_kv, dtype, seed=rows, windows=windows, heads=heads)
+    got = flashtopk.Selector(TOPK, num_heads=heads, dtype=dtype, pruning=pruning, return_scores=True).run(
+        q, kv, w, ks, ke, s)
+    assert_same(got, canonical_topk(dense_scores(q, kv, s, w, ks, ke)))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_exact_pruning_64_heads(dtype):
+    """64 heads over 140K keys, adaptive pruning that actually prunes: positive weights and the keys 95% of the
+    samples would keep shrunk a hundredfold put the estimate at ~4% of the samples, so the call prunes (last_info)
+    and every row is still the exact canonical top-k of the dense scan's scores."""
+    if gpu_arch() != 10:
+        pytest.skip("64 heads need an SM100 GPU")
+    q, kv, s, w, ks, ke = make_call(515, 140000, dtype, seed=72, heads=64)
+    kv = kv.clone()
+    small = torch.rand(kv.shape[0], device="cuda") > 0.05
+    kv[small] = (kv[small].float() * 0.01).to(dtype)
+    w = w.abs()
+    sel = flashtopk.Selector(TOPK, num_heads=64, dtype=dtype, pruning="adaptive", return_scores=True)
+    got = sel.run(q, kv, w, ks, ke, s)
+    assert sel.last_info.pruned is True and sel.last_info.estimate < 0.5
     assert_same(got, canonical_topk(dense_scores(q, kv, s, w, ks, ke)))
 
 

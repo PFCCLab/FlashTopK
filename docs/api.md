@@ -75,6 +75,33 @@ selector = flashtopk.Selector(topk=2048, dtype=torch.float8_e4m3fn).plan(max_row
 indices = selector.run(q, kv, weights, ks, ke, kv_scales)
 ```
 
+## flashtopk.indexer_topk
+
+```python
+flashtopk.indexer_topk(index_q, index_k, weights, top_k, *, softmax_scale, ratio=1, seq_offset=0, valid_range=None,
+                       return_scores=False, pruning="off") -> indices, length, or indices, length, scores
+"""The indexer's own top-k: Fleet's `cudnn_indexer_topk_fwd` on [B, S, H, 128] query batches, without the dense
+[B, S, S_k] score matrix (also exported as flashtopk.flashtopk_indexer_topk).
+index_q (B, S, H, 128) bfloat16, index_k (B, S_k, 128) bfloat16, weights (B, S, H) bfloat16 or float32; H 32 or 64
+(64 on SM100). Row (b, t) selects the top_k keys of [valid_start, min(valid_end, (seq_offset + t + 1) // ratio)) --
+valid_range None means the causal prefix. Ids are global per batch in [0, S_k), padded with -1 (indices) and -inf
+(scores); length is min(top_k, window), i.e. (indices >= 0).sum(-1). pruning="off" by default: at 32 and 64 heads the
+bound costs more than it saves.
+"""
+
+For example, the indexer step of a DSA layer:
+
+```python
+indices, length, scores = flashtopk.indexer_topk(index_q, index_k_comp, weights, 2048,
+                                                 softmax_scale=128 ** -0.5 * indexer_softmax_scale,
+                                                 valid_range=valid_range, return_scores=need_loss)
+```
+
+It runs on PyTorch and, unchanged, on PaddlePaddle tensors under `paddle.enable_compat(scope={"flashtopk"})`:
+there `torch` is Paddle's compatibility proxy, the workspace comes from Paddle's allocator, and each call points the
+kernels' TVM-FFI environment stream at Paddle's current stream. PyTorch itself is never imported, so the package also
+installs into a Paddle-only environment (`pip install . --no-deps`; `torch` is an optional extra).
+
 ## Other interfaces
 
 ```python

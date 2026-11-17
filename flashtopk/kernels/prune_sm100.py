@@ -26,8 +26,9 @@ side for packed FP32 arithmetic. The bound, in this order of operations,
 
     s_k * (sum_{c < 14} (x_c + |x_c|) (w_c / 2) - relu(x_14 w_14 + x_15 w_15)) + allowance * (s_k ||k||),
 
-against the row's raw gate (and window off the interior) sets, per 8-row half and key, whether any of the half's
-rows keeps it: mask[2 * tile + half][block][4], one bit per key, every word of the tile's KV range written.
+against the row's raw gate (and window off the interior) sets, per refine row group (``group_rows`` rows: 8 at 32
+heads, 4 at 64) and key, whether any of the group's rows keeps it: mask[planes * tile + group][block][4] with
+planes = 16 / group_rows, one bit per key, every word of the tile's KV range written.
 refine_sm100.py scores those keys in full.
 
 Warp roles (384 threads): warps 0-7 two math warpgroups (group w the blocks 2i + w), warps 8-9 TMA (Q and weights
@@ -60,8 +61,12 @@ NUM_MATH_WG = 2
 
 
 class PruneSm100:
-    def __init__(self, *, bf16: bool = False):
+    def __init__(self, *, bf16: bool = False, group_rows: int = 8):
+        if BLOCK_Q % group_rows or group_rows % 2:
+            raise ValueError(f"group_rows must be an even divisor of {BLOCK_Q}, got {group_rows}")
         self.bf16 = bf16
+        self.group_rows = group_rows
+        self.planes = BLOCK_Q // group_rows
         # A BF16 KV stage is twice an FP8 one: two stages per ring keep shared memory under 227 KB.
         self.num_kv_stages = 2 if bf16 else NUM_KV_STAGES
         self.N = BLOCK_Q * COLS
@@ -107,7 +112,7 @@ class PruneSm100:
         inv_delta: cute.Tensor,
         th_bucket: cute.Tensor,
         allowance: cute.Tensor,  # [num_q] f32
-        mask: cute.Tensor,  # [2 * tiles * mask_blocks * 4] i32
+        mask: cute.Tensor,  # [planes * tiles * mask_blocks * 4] i32
         num_q: Int32,
         seq_len_kv: Int32,
         mask_blocks: Int32,
@@ -471,7 +476,9 @@ class PruneSm100:
 
         kv_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
         umma_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        tile_base = (2 * tile * mask_blocks) * 4 + quad
+        planes = self.planes
+        group_rows = self.group_rows
+        tile_base = (planes * tile * mask_blocks) * 4 + quad
         for pair in cutlass.range(num_pairs, unroll=1):
             j = pair * NUM_MATH_WG + warpgroup_idx
             umma_pipeline_math.consumer_wait(umma_cons)
@@ -484,7 +491,7 @@ class PruneSm100:
             blk_lo = kv_start + j * BLOCK_KV
             kv_idx = blk_lo + m_coord
             interior = (blk_lo >= cover_lo) & (blk_lo + BLOCK_KV <= cover_hi)
-            surv = [cutlass.Boolean(False), cutlass.Boolean(False)]
+            surv = [cutlass.Boolean(False) for _ in range(planes)]
             for e in cutlass.range_constexpr(NUM_EPI_SUBTILES):
                 if e > 0:
                     cute.arch.fence_view_async_tmem_load()
@@ -500,16 +507,15 @@ class PruneSm100:
                     for half_row in cutlass.range_constexpr(2):
                         r = 2 * p + half_row
                         in_win = interior | (cutlass.Uint32(kv_idx - sWin[(r, 0)]) < cutlass.Uint32(sWin[(r, 1)]))
-                        surv[p // 4] = surv[p // 4] | (keep[half_row] & in_win)
+                        surv[r // group_rows] = surv[r // group_rows] | (keep[half_row] & in_win)
             kv_pipeline_math.consumer_release(kv_cons)
             kv_cons.advance()
-            m_lo = cute.arch.vote_ballot_sync(surv[0])
-            m_hi = cute.arch.vote_ballot_sync(surv[1])
+            plane_masks = [cute.arch.vote_ballot_sync(surv[g]) for g in range(planes)]
             if (lane == 0) & (j < num_kv):
                 gblock = kv_start // BLOCK_KV + j
                 base = mMask.iterator.toint() + cutlass.Int64(tile_base + gblock * 4) * 4
-                store_global_b32(base, m_lo)
-                store_global_b32(base + cutlass.Int64(mask_blocks * 4) * 4, m_hi)
+                for g in cutlass.range_constexpr(planes):
+                    store_global_b32(base + cutlass.Int64(g * mask_blocks * 4) * 4, plane_masks[g])
             cute.arch.sync_warp()
 
         if has_work:
